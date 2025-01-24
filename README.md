@@ -29,3 +29,15 @@ Our experiments demonstrate MTSAD's high efficacy on the SWaT and WADI datasets,
 
 ## 📂 Repository Structure
 
+# Requirements:
+pandas==2.0.3
+numpy==1.24.0
+matplotlib==3.7.2
+seaborn==0.12.2
+plotly==5.9.0
+IPython==8.15.0
+statsmodels==0.14.0
+torch==2.1.1+cu118
+scipy==1.11.1
+tqdm==4.65.0
+
