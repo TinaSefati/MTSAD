@@ -1,166 +1,238 @@
-import time
-import numpy as np
 import torch
 import torch.nn as nn
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import pandas as pd
-from sklearn.metrics import f1_score, roc_auc_score
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias):
+        super(ConvLSTMCell, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.padding = kernel_size[0] // 2, kernel_size[1] // 2
+        self.bias = bias
+
+        self.conv = nn.Conv2d(
+            in_channels=self.input_dim + self.hidden_dim,
+            out_channels=4 * self.hidden_dim,
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+            bias=self.bias
+        )
+
+    def forward(self, input_tensor, cur_state):
+        h_cur, c_cur = cur_state
+        combined = torch.cat([input_tensor, h_cur], dim=1)  # concatenate along channel axis
+        combined_conv = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
+                torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
 
 
-losses_train = []  # To store the loss for each epoch
-best_loss = 100
-best_recall = 0
-losses_test = []
-recall_hist = []
-precision_hist = []
-f1_hist = []
-auc_hist = []
-TP_hist = []
-TN_hist = []
-FP_hist = []
-FN_hist = []
+class ConvLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers,
+                 batch_first=False, bias=True, return_all_layers=False):
+        super(ConvLSTM, self).__init__()
+
+        self._check_kernel_size_consistency(kernel_size)
+
+        kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
+        hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
+        if not len(kernel_size) == len(hidden_dim) == num_layers:
+            raise ValueError('Inconsistent list length.')
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.bias = bias
+        self.return_all_layers = return_all_layers
+
+        cell_list = []
+        for i in range(self.num_layers):
+            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
+            cell_list.append(ConvLSTMCell(
+                input_dim=cur_input_dim,
+                hidden_dim=self.hidden_dim[i],
+                kernel_size=self.kernel_size[i],
+                bias=self.bias
+            ))
+        self.cell_list = nn.ModuleList(cell_list)
+
+    def forward(self, input_tensor, hidden_state=None):
+        if not self.batch_first:
+            input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
+
+        b, _, _, h, w = input_tensor.size()
+
+        if hidden_state is None:
+            hidden_state = self._init_hidden(batch_size=b, image_size=(h, w))
+        else:
+            raise NotImplementedError("Stateful mode not implemented")
+
+        layer_output_list = []
+        last_state_list = []
+        seq_len = input_tensor.size(1)
+        cur_layer_input = input_tensor
+
+        for layer_idx in range(self.num_layers):
+            h, c = hidden_state[layer_idx]
+            output_inner = []
+            for t in range(seq_len):
+                h, c = self.cell_list[layer_idx](
+                    input_tensor=cur_layer_input[:, t, :, :, :],
+                    cur_state=[h, c]
+                )
+                output_inner.append(h)
+
+            layer_output = torch.stack(output_inner, dim=1)
+            cur_layer_input = layer_output
+            layer_output_list.append(layer_output)
+            last_state_list.append([h, c])
+
+        if not self.return_all_layers:
+            layer_output_list = layer_output_list[-1:]
+            last_state_list = last_state_list[-1:]
+
+        return layer_output_list, last_state_list
+
+    def _init_hidden(self, batch_size, image_size):
+        init_states = []
+        for i in range(self.num_layers):
+            init_states.append(self.cell_list[i].init_hidden(batch_size, image_size))
+        return init_states
+
+    @staticmethod
+    def _check_kernel_size_consistency(kernel_size):
+        if not (isinstance(kernel_size, tuple) or
+                (isinstance(kernel_size, list) and all(isinstance(elem, tuple) for elem in kernel_size))):
+            raise ValueError('`kernel_size` must be tuple or list of tuples')
+
+    @staticmethod
+    def _extend_for_multilayer(param, num_layers):
+        if not isinstance(param, list):
+            param = [param] * num_layers
+        return param
 
 
+class MTSAD(nn.Module):
+    def __init__(self, feats, hidden_dim, seq_len):
+        super(MTSAD, self).__init__()
+        self.name = 'MTSAD'
+        self.n_feats = feats
+        self.n_window = seq_len
+        self.hidden_dim = hidden_dim
+        self.conv_lstm = ConvLSTM(1, hidden_dim, (3, 3), 3, batch_first=True, bias=True)
 
-# Define functions for each distinct phase
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(hidden_dim, 1, (3, 3), 1, 1),
+            nn.Sigmoid()
+        )
 
-def train_epochs(epoch, num_epochs, model, optimizer, criterion, train_loader, device):
-    total_loss = 0.0
-    train_start_time = time.time()
-    model.train()
-    # Use num_epochs instead of NUM_EPOCHS
-    with tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', unit='batch') as tqdm_loader:
-        for batch_data in tqdm_loader:
-            optimizer.zero_grad()
-            input_data, _ = batch_data  # Assuming data loader returns (input_data, labels)
-            input_data = input_data.to(device)
+    def forward(self, g):
+        """
+        Expects input tensor `g` of shape (batch_size, feats, seq_len).
+        """
+        z = g.view(g.size(0), 1, 1, self.n_feats, self.n_window)
+        _, last_state_list = self.conv_lstm(z)
+        h, _ = last_state_list[-1]
+        x = self.decoder(h)
+        return x.view(-1, self.n_window, self.n_feats)
 
-            # Forward pass
-            output_data = model(input_data)
+    
+class MTSAD_NoConvLSTM(nn.Module):
+    def __init__(self, feats, hidden_dim, seq_len, num_layers=3):
+        super(MTSAD_NoConvLSTM, self).__init__()
+        self.name = 'MTSAD_NoConvLSTM'
+        self.n_feats = feats
+        self.n_window = seq_len
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
 
-            # Compute the loss
-            loss = criterion(output_data, input_data)
+        # LSTM Encoder: Replace ConvLSTM with standard LSTM
+        self.lstm = nn.LSTM(
+            input_size=feats,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=False
+        )
 
-            # Backward pass and optimization
-            loss.backward()
-            optimizer.step()
+        # Decoder: Use Linear layers instead of ConvTranspose2d
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, feats * seq_len),
+            nn.Sigmoid()
+        )
 
-            total_loss += loss.item()
+    def forward(self, g):
+        """
+        Expects input tensor `g` of shape (batch_size, feats, seq_len).
+        """
+        
+        # Reshape input for LSTM: (batch_size, seq_len, feats)
+#         g = g.permute(0, 2, 1)  # (batch_size, seq_len, feats)
+        
+        # Pass through LSTM
+        lstm_out, (h_n, c_n) = self.lstm(g)  # h_n: (num_layers, batch, hidden_dim)
 
-            # Update tqdm description with the current loss
-            tqdm_loader.set_postfix({'Loss': loss.item()})
+        # Use the last hidden state from the top LSTM layer
+        last_hidden = h_n[-1]  # (batch, hidden_dim)
 
-    training_time = time.time() - train_start_time
-    return training_time, input_data, output_data
+        # Decode the hidden state
+        x = self.decoder(last_hidden)  # (batch, feats * seq_len)
 
+        # Reshape to (batch, seq_len, feats)
+        x = x.view(-1, self.n_window, self.n_feats)
 
-def plot_signals(input_data, output_data):
-    # Plot real data
-    plt.plot(input_data[-1].to('cpu').detach().numpy())
-    plt.title("Real Data")
-    plt.xlabel("Time")
-    plt.ylabel("Value")
-    plt.show()
+        return x
 
-    # Plot reconstructed data
-    plt.plot(output_data[-1].to('cpu').detach().numpy())
-    plt.title("Reconstructed Data")
-    plt.xlabel("Time")
-    plt.ylabel("Value")
-    plt.show()
+class MTSAD_NoTransposedConv_Dynamic(nn.Module):
+    def __init__(self, feats, hidden_dim, seq_len):
+        super(MTSAD_NoTransposedConv_Dynamic, self).__init__()
+        self.name = 'MTSAD_NoTransposedConv_Dynamic'
+        self.n_feats = feats
+        self.n_window = seq_len
+        self.hidden_dim = hidden_dim
 
-def evaluate_epoch(epoch, num_epochs, model, test_loader, device, target_list):
-    global losses_test, recall_hist, precision_hist, f1_hist, auc_hist
-    global TP_hist, TN_hist, FP_hist, FN_hist
+        # ConvLSTM Encoder
+        self.conv_lstm = ConvLSTM(1, hidden_dim, (3, 3), num_layers=3, batch_first=True, bias=True)
 
-    anomaly_scores = []
-    test_loss = 0.0
-    model.eval()
-    eval_start_time = time.time()
+        # Temporary dummy input to infer the flattened size
+        dummy_input = torch.zeros(1, 1, 1, feats, seq_len)
+        _, last_state = self.conv_lstm(dummy_input)
+        h, _ = last_state[-1]
+        flattened_size = hidden_dim * self.n_feats * self.n_window
 
-    with torch.no_grad():
-        with tqdm(test_loader, desc="Computing Anomaly Scores", unit="batch") as tqdm_loader:
-            for batch_data in tqdm_loader:
-                input_data, _ = batch_data
-                input_data = input_data.to(device)
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flattened_size, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, self.n_feats * self.n_window),
+            nn.Sigmoid()
+        )
 
-                # Forward pass
-                output_data = model(input_data)
+    def forward(self, g):
+        """
+        Expects input tensor `g` of shape (batch_size, feats, seq_len).
+        """
+        z = g.view(g.size(0), 1, 1, self.n_feats, self.n_window)  # (B, C, H, W, T)
+        _, last_state_list = self.conv_lstm(z)
+        h, _ = last_state_list[-1]  # h shape: (batch, hidden_dim, H, W)
 
-                # Compute anomaly scores (MSE in this example)
-                mse = nn.MSELoss(reduction='none')(output_data, input_data)
-                mse_per_sample = mse.view(mse.size(0), -1).mean(dim=1)
-                anomaly_scores.extend(mse_per_sample.cpu().numpy())
-                test_loss += np.average(anomaly_scores)
-
-    avg_test_loss = test_loss / len(test_loader)
-    losses_test.append(avg_test_loss)
-    print(f'Epoch {epoch+1}/{num_epochs}, Test   Loss = {avg_test_loss}')
-
-    eval_end_time = time.time()
-    eval_time = eval_end_time - eval_start_time
-
-    # Plot histogram of anomaly scores
-    anomaly_scores_np = np.array(anomaly_scores)
-    plt.hist(anomaly_scores_np, bins=50, density=True, alpha=0.75)
-    plt.xlabel('Anomaly Score')
-    plt.ylabel('Density')
-    plt.title('Distribution of Anomaly Scores')
-    plt.show()
-
-    # Threshold optimization and evaluation
-    anomaly_scores_tensor = torch.tensor(anomaly_scores_np, device='cpu')
-    target_list = torch.tensor(target_list, device='cpu')
-
-    percentiles = np.arange(90, 100, 0.5)
-    f1_scores = []
-    for percentile in percentiles:
-        threshold = np.percentile(anomaly_scores_tensor, percentile)
-        predictions = (anomaly_scores_tensor > threshold)
-        f1 = f1_score(target_list, predictions, average='micro')
-        f1_scores.append(f1)
-
-    best_percentile = percentiles[np.argmax(f1_scores)]
-    best_threshold = np.percentile(anomaly_scores_tensor, best_percentile)
-    print(f'Best Threshold: {best_threshold:.4f} (at {best_percentile} percentile)')
-
-    predicted_labels = (anomaly_scores_tensor > best_threshold)
-    predicted_labels = np.array([-1 if x else 1 for x in predicted_labels])
-    target_list = target_list.numpy()
-
-    # Compute confusion matrix components
-    TP = np.sum((target_list == -1) & (predicted_labels == -1))
-    TN = np.sum((target_list == 1) & (predicted_labels == 1))
-    FP = np.sum((target_list == 1) & (predicted_labels == -1))
-    FN = np.sum((target_list == -1) & (predicted_labels == 1))
-
-
-    # Calculate evaluation metrics
-    precision = TP / (TP + FP + 1e-8)
-    recall = TP / (TP + FN + 1e-8)
-    f1s_score = 2 * (precision * recall) / (precision + recall + 1e-8)
-    accuracy = (TP + TN) / (TP + TN + FP + FN)
-    auc = roc_auc_score(target_list, predicted_labels)
-
-    recall_hist.append(recall)
-    precision_hist.append(precision)
-    f1_hist.append(f1s_score)
-    auc_hist.append(auc)
-    TP_hist.append(TP)
-    TN_hist.append(TN)
-    FP_hist.append(FP)
-    FN_hist.append(FN)
-
-    print(f'AUC: {auc:.8f}')
-    print(f'Accuracy: {accuracy:.8f}')
-    print(f'Precision: {precision:.8f}')
-    print(f'Recall: {recall:.8f}')
-    print(f'F1-Score: {f1s_score:.8f}')
-    print('TP = ', TP)
-    print('TN = ', TN)
-    print('FP = ', FP)
-    print('FN = ', FN)
-
-    return eval_time
-
+        # Flatten h and pass through the linear decoder
+        x = self.decoder(h)
+        x = x.view(-1, self.n_window, self.n_feats)  # (batch, seq_len, feats)
+        return x
+    
