@@ -1,6 +1,8 @@
 # MTSAD
 Enhancing Autoncoder Models for Multivariate Time Series Anomaly Detection: The Role of Noise and Data Amount
 
+Link: https://link.springer.com/article/10.1007/s11227-025-07044-w
+
 # MTSAD: Multivariate Time Series Anomaly Detection
 
 This repository contains the implementation of the **MTSAD** model, an advanced framework for **unsupervised anomaly detection in multivariate time series data**. The MTSAD model leverages **ConvLSTM networks** to capture spatio-temporal correlations and **Transposed Convolution layers** for effective reconstruction, optimizing anomaly detection for real-world scenarios.
